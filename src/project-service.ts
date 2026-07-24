@@ -1,0 +1,60 @@
+import { access, readFile } from "node:fs/promises";
+import path from "node:path";
+import { createProject, getProjectOverview, inspectProjectMigration, migrateProject, openProject } from "@osnova/project";
+import type { OsnovaProject } from "@osnova/types";
+
+export class ProjectService {
+  readonly #open = new Map<string, OsnovaProject>();
+  readonly #extensionVersions = new Map<string, Record<string, string>>();
+
+  async create(input: { rootPath: string; id: string; name: string; description?: string }): Promise<OsnovaProject> {
+    await assertManifestAbsent(input.rootPath);
+    const project = await createProject({ ...input, formatVersion: "0.2" });
+    this.#open.set(path.resolve(project.rootPath), project);
+    this.#extensionVersions.set(path.resolve(project.rootPath), {});
+    return project;
+  }
+
+  async open(rootPath: string): Promise<OsnovaProject> {
+    const resolved = path.resolve(rootPath);
+    const project = await openProject(resolved);
+    this.#open.set(resolved, project);
+    this.#extensionVersions.set(resolved, await readExtensionVersions(resolved));
+    return project;
+  }
+
+  get(rootPath: string): OsnovaProject {
+    const resolved = path.resolve(rootPath);
+    const project = this.#open.get(resolved);
+    if (!project) throw new Error(`Project is not open: ${resolved}`);
+    return project;
+  }
+
+  list(): OsnovaProject[] { return [...this.#open.values()].map((project) => structuredClone(project)); }
+  extensionVersions(rootPath: string): Record<string, string> { return { ...(this.#extensionVersions.get(path.resolve(rootPath)) ?? {}) }; }
+  async validate(rootPath: string) { return getProjectOverview(path.resolve(rootPath)); }
+  async migrationPlan(rootPath: string) { return inspectProjectMigration(path.resolve(rootPath)); }
+
+  async migrate(rootPath: string, options: { dryRun?: boolean } = {}) {
+    const result = await migrateProject(path.resolve(rootPath), options);
+    if (!result.dryRun) await this.open(rootPath);
+    return result;
+  }
+}
+
+async function readExtensionVersions(rootPath: string): Promise<Record<string, string>> {
+  try {
+    const lock = JSON.parse(await readFile(path.join(rootPath, ".osnova", "extensions", "lock.json"), "utf8")) as { extensions?: Record<string, { version?: unknown }> };
+    return Object.fromEntries(Object.entries(lock.extensions ?? {}).flatMap(([id, value]) => typeof value.version === "string" ? [[id, value.version]] : []));
+  } catch { return {}; }
+}
+
+async function assertManifestAbsent(rootPath: string): Promise<void> {
+  try {
+    await access(path.join(rootPath, "osnova.json"));
+    throw new Error("Project manifest already exists. Use project.open or project.migrate.");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+    throw error;
+  }
+}

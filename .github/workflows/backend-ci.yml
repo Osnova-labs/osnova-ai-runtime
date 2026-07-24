@@ -1,0 +1,143 @@
+name: Reborn backend
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout product documentation
+        uses: actions/checkout@v4
+        with:
+          repository: Osnova-labs/osnova-docs
+          token: ${{ secrets.OSNOVA_REPO_TOKEN || github.token }}
+          path: osnova-docs
+
+      - name: Checkout public specification
+        uses: actions/checkout@v4
+        with:
+          repository: Osnova-labs/osnova-spec
+          token: ${{ secrets.OSNOVA_REPO_TOKEN || github.token }}
+          path: osnova-spec
+
+      - name: Checkout core types
+        uses: actions/checkout@v4
+        with:
+          repository: Osnova-labs/osnova-core
+          token: ${{ secrets.OSNOVA_REPO_TOKEN || github.token }}
+          path: osnova-core
+
+      - name: Checkout extension SDK types
+        uses: actions/checkout@v4
+        with:
+          repository: Osnova-labs/osnova-plugin-sdk
+          token: ${{ secrets.OSNOVA_REPO_TOKEN || github.token }}
+          path: osnova-plugin-sdk
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.5.2
+
+      - name: Parse public JSON contracts
+        working-directory: osnova-spec
+        shell: bash
+        run: node scripts/verify-contracts.mjs --core ../osnova-core --sdk ../osnova-plugin-sdk
+
+      - name: Build normative documentation
+        working-directory: osnova-docs
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+  backend:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout runtime
+        uses: actions/checkout@v4
+        with:
+          path: osnova-runtime
+
+      - name: Checkout core
+        uses: actions/checkout@v4
+        with:
+          repository: Osnova-labs/osnova-core
+          token: ${{ secrets.OSNOVA_REPO_TOKEN || github.token }}
+          path: osnova-core
+
+      - name: Checkout extension SDK
+        uses: actions/checkout@v4
+        with:
+          repository: Osnova-labs/osnova-plugin-sdk
+          token: ${{ secrets.OSNOVA_REPO_TOKEN || github.token }}
+          path: osnova-plugin-sdk
+
+      - name: Checkout extension examples
+        uses: actions/checkout@v4
+        with:
+          repository: Osnova-labs/osnova-plugins
+          token: ${{ secrets.OSNOVA_REPO_TOKEN || github.token }}
+          path: osnova-plugins
+
+      - name: Checkout desktop bridge
+        uses: actions/checkout@v4
+        with:
+          repository: Osnova-labs/osnova-desktop
+          token: ${{ secrets.OSNOVA_REPO_TOKEN || github.token }}
+          path: osnova-desktop
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.5.2
+
+      - name: Core contracts
+        working-directory: osnova-core
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+          pnpm test
+          pnpm lint
+
+      - name: Extension SDK
+        working-directory: osnova-plugin-sdk
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm test
+          pnpm typecheck
+
+      - name: Runtime and headless CLI
+        working-directory: osnova-runtime
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm test
+          pnpm selftest
+          pnpm typecheck
+
+      - name: Reference extensions
+        working-directory: osnova-plugins
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm test
+          pnpm test:runtime
+
+      - name: Desktop backend bridge
+        working-directory: osnova-desktop
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build

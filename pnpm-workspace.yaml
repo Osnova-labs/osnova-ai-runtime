@@ -1,0 +1,6 @@
+packages:
+  - .
+  - ../osnova-core/packages/*
+  - ../osnova-plugin-sdk
+
+linkWorkspacePackages: true
