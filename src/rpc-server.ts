@@ -41,9 +41,13 @@ export async function startRpcServer(runtime: OsnovaRuntime, options: { address?
   };
   const runtimeChanged = (state: unknown) => broadcast(authenticated, { jsonrpc: "2.0", method: "runtime.changed", params: state });
   const artifactPublished = (event: unknown) => broadcast(authenticated, { jsonrpc: "2.0", method: "artifact.published", params: event });
+  const agentActivity = (event: unknown) => broadcast(authenticated, { jsonrpc: "2.0", method: "agent.activity", params: event });
+  const agentOutputDelta = (event: unknown) => broadcast(authenticated, { jsonrpc: "2.0", method: "agent.output.delta", params: event });
   runtime.jobs.on("changed", changed);
   runtime.supervisor.on("changed", runtimeChanged);
   runtime.ingestor.on("published", artifactPublished);
+  runtime.agent.on("activity", agentActivity);
+  runtime.agent.on("output.delta", agentOutputDelta);
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(address, () => resolve());
@@ -56,6 +60,8 @@ export async function startRpcServer(runtime: OsnovaRuntime, options: { address?
       runtime.jobs.off("changed", changed);
       runtime.supervisor.off("changed", runtimeChanged);
       runtime.ingestor.off("published", artifactPublished);
+      runtime.agent.off("activity", agentActivity);
+      runtime.agent.off("output.delta", agentOutputDelta);
       for (const socket of authenticated) socket.destroy();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       if (process.platform !== "win32") await rm(address, { force: true });
@@ -128,7 +134,8 @@ async function dispatch(runtime: OsnovaRuntime, method: string, params: Record<s
     case "context.search": return runtime.indexer.search(projectPath(), requiredString(params, "query"), optionalNumber(params.limit));
     case "connector.list": return runtime.connectors.list();
     case "connector.sync": return runtime.syncConnector(projectPath(), requiredString(params, "connectorId"), params.approval as ApprovalDecision | undefined);
-    case "agent.plan": return runtime.agent.plan({ projectPath: projectPath(), goal: requiredString(params, "goal"), sessionId: optionalString(params.sessionId), providerId: optionalString(params.providerId), model: optionalString(params.model), draft: params.draft as never, maxSteps: optionalNumber(params.maxSteps), maxDurationSeconds: optionalNumber(params.maxDurationSeconds), contextBudgetTokens: optionalNumber(params.contextBudgetTokens), recipientApproval: params.recipientApproval as never, providerApproval: params.providerApproval as ApprovalDecision | undefined });
+    case "agent.plan": return runtime.agent.plan({ projectPath: projectPath(), goal: requiredString(params, "goal"), sessionId: optionalString(params.sessionId), providerId: optionalString(params.providerId), model: optionalString(params.model), draft: params.draft as never, maxSteps: optionalNumber(params.maxSteps), maxDurationSeconds: optionalNumber(params.maxDurationSeconds), contextBudgetTokens: optionalNumber(params.contextBudgetTokens), recipientApproval: params.recipientApproval as never, providerApproval: params.providerApproval as ApprovalDecision | undefined, requestId: optionalString(params.requestId) });
+    case "agent.plan.cancel": return { cancelled: runtime.agent.cancelPlanning(requiredString(params, "requestId")) };
     case "agent.get": return runtime.agent.get(requiredString(params, "runId"));
     case "agent.execute": return runtime.agent.execute(requiredString(params, "runId"));
     case "agent.approve": return runtime.agent.approve(requiredString(params, "runId"), requiredString(params, "stepId"), params.decision as unknown as ApprovalDecision);
@@ -140,6 +147,7 @@ async function dispatch(runtime: OsnovaRuntime, method: string, params: Record<s
     case "model.install": return runtime.models.install(params.dependency as never, { allowNetwork: params.allowNetwork === true });
     case "model.list": return runtime.models.list();
     case "model.provider.configure": return runtime.configureModelProvider(params.config as never, optionalString(params.secret));
+    case "model.provider.config-list": return runtime.listModelProviderConfigs();
     case "model.provider.list": return runtime.agent.listProviders();
     case "credential.remove": await runtime.credentials.delete(requiredString(params, "account")); return { ok: true };
     case "model.remove": await runtime.removeModel(requiredString(params, "sha256")); return { ok: true };

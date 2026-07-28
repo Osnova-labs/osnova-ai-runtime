@@ -1,16 +1,20 @@
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { appendSessionEvent } from "@osnova/project";
-import type { AgentPlan, AgentStep, ApprovalDecision, JobDescriptor } from "@osnova/types";
+import { appendSessionEvent, readSession } from "@osnova/project";
+import type { AgentPlan, AgentStep, ApprovalDecision, ContextSource, JobDescriptor } from "@osnova/types";
 import { writeJsonAtomic } from "./atomic.js";
 import type { ContextBroker } from "./context-broker.js";
 import type { JobManager } from "./job-manager.js";
 import type { ModelProvider } from "./model-provider.js";
-import { requestAgentPlan } from "./model-provider.js";
+import { requestAgentPlan, requestAgentReply, requestContextSelection } from "./model-provider.js";
 import type { OperationRegistry } from "./operation-registry.js";
 import type { OperationService } from "./operation-service.js";
 import { validateJsonSchema } from "./schema.js";
+
+const DEFAULT_CONTEXT_BUDGET_TOKENS = 16_000;
+const MAX_CONTEXT_BUDGET_TOKENS = 128_000;
 
 export interface AgentRun {
   id: string;
@@ -19,6 +23,13 @@ export interface AgentRun {
   plan: AgentPlan;
   providerId?: string;
   model?: string;
+  response?: string;
+  context?: {
+    sources: ContextSource[];
+    tokenEstimate: number;
+    truncated: boolean;
+  };
+  activities?: AgentActivity[];
   status: "ready" | "running" | "waiting-approval" | "succeeded" | "failed" | "cancelled";
   stepJobs: Record<string, string>;
   error?: string;
@@ -38,10 +49,34 @@ export interface CreatePlanInput {
   contextBudgetTokens?: number;
   recipientApproval?: { recipient: "cloud"; approved: boolean; decidedAt: string };
   providerApproval?: ApprovalDecision;
+  requestId?: string;
 }
 
-export class AgentOrchestrator {
+export interface AgentOutputDelta {
+  requestId: string;
+  projectPath: string;
+  sessionId?: string;
+  delta: string;
+}
+
+export interface AgentActivity {
+  requestId: string;
+  projectPath: string;
+  sessionId?: string;
+  stage: "catalog" | "selecting" | "research" | "answer" | "planning";
+  status: "running" | "completed";
+  message: string;
+  sources?: number;
+  tokens?: number;
+  queries?: number;
+  steps?: number;
+  durationMs?: number;
+}
+
+export class AgentOrchestrator extends EventEmitter {
   readonly #providers = new Map<string, ModelProvider>();
+  readonly #planning = new Map<string, AbortController>();
+  readonly #activityTraces = new Map<string, AgentActivity[]>();
 
   constructor(
     readonly dataRoot: string,
@@ -49,7 +84,7 @@ export class AgentOrchestrator {
     readonly context: ContextBroker,
     readonly operations: OperationService,
     readonly jobs: JobManager
-  ) {}
+  ) { super(); }
 
   registerProvider(provider: ModelProvider): void { this.#providers.set(provider.id, provider); }
   listProviders(): Array<{ id: string; recipient: "local" | "cloud"; sourceExtensionId?: string; permissions: string[]; risk: string }> {
@@ -57,16 +92,43 @@ export class AgentOrchestrator {
   }
 
   async plan(input: CreatePlanInput): Promise<AgentRun> {
+    const requestId = input.requestId ?? randomUUID();
+    if (this.#planning.has(requestId)) throw new Error(`Agent request is already running: ${requestId}`);
+    const controller = new AbortController();
+    this.#planning.set(requestId, controller);
+    this.#activityTraces.set(requestId, []);
+    try {
+      return await this.#plan(input, requestId, controller.signal);
+    } finally {
+      this.#planning.delete(requestId);
+      this.#activityTraces.delete(requestId);
+    }
+  }
+
+  cancelPlanning(requestId: string): boolean {
+    const controller = this.#planning.get(requestId);
+    if (!controller) return false;
+    controller.abort(new Error("Agent response was cancelled."));
+    return true;
+  }
+
+  async #plan(input: CreatePlanInput, requestId: string, cancellationSignal: AbortSignal): Promise<AgentRun> {
     const maxSteps = Math.min(Math.max(input.maxSteps ?? 12, 1), 50);
     const maxDurationSeconds = Math.min(Math.max(input.maxDurationSeconds ?? 1_800, 1), 86_400);
-    const contextBudgetTokens = Math.min(Math.max(input.contextBudgetTokens ?? 2_000, 128), 32_000);
+    const contextBudgetTokens = Math.min(
+      Math.max(input.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS, 128),
+      MAX_CONTEXT_BUDGET_TOKENS
+    );
+    const signal = AbortSignal.any([cancellationSignal, AbortSignal.timeout(300_000)]);
     let candidate: AgentPlan;
     let planningProviderId: string | undefined;
     let planningModel: string | undefined;
+    let responseText: string | undefined;
+    let researchSummary: AgentRun["context"];
     if (input.draft) {
       const raw = { goal: input.draft.goal, steps: input.draft.steps };
       assertPlanCandidate(raw, maxSteps);
-      candidate = { ...raw, schemaVersion: "1", id: randomUUID(), createdAt: new Date().toISOString(), maxSteps: Math.min(input.draft.maxSteps ?? maxSteps, maxSteps), maxDurationSeconds };
+      candidate = { goal: raw.goal, steps: raw.steps, schemaVersion: "1", id: randomUUID(), createdAt: new Date().toISOString(), maxSteps: Math.min(input.draft.maxSteps ?? maxSteps, maxSteps), maxDurationSeconds };
     } else {
       const provider = input.providerId ? this.#providers.get(input.providerId) : undefined;
       if (!provider || !input.model) throw new Error("Agent planning requires a configured model provider and model, or an explicit draft plan.");
@@ -95,7 +157,17 @@ export class AgentOrchestrator {
       if (provider.recipient === "cloud" && !(input.recipientApproval?.approved && input.recipientApproval.recipient === "cloud")) {
         throw new Error("Cloud model planning requires explicit data-recipient approval.");
       }
+      const catalogStartedAt = Date.now();
+      this.#activity(input, requestId, { stage: "catalog", status: "running", message: "Читаю карту проекта" });
       const preview = await this.context.preview(input.projectPath, contextBudgetTokens);
+      this.#activity(input, requestId, {
+        stage: "catalog",
+        status: "completed",
+        message: "Карта проекта прочитана",
+        sources: numericField(preview.structured, "availableSourceCount") ?? preview.sources.length,
+        tokens: preview.tokenEstimate,
+        durationMs: Date.now() - catalogStartedAt
+      });
       if (!preview.allowedRecipients.includes(provider.recipient)) throw new Error(`Compact context cannot be sent to ${provider.recipient}.`);
       if (provider.recipient === "cloud" && input.sessionId) await appendSessionEvent(input.projectPath, input.sessionId, {
         type: "approval", data: { kind: "model-context", providerId: provider.id, recipient: "cloud", approved: true, decidedAt: input.recipientApproval?.decidedAt }
@@ -104,10 +176,121 @@ export class AgentOrchestrator {
         id: definition.id, title: definition.title, description: definition.description,
         inputSchema: definition.inputSchema, produces: definition.produces, risk: definition.risk
       }));
-      const response = await requestAgentPlan(provider, input.model, input.goal, `${preview.text ?? ""}\n\nOperations:\n${JSON.stringify(capabilities)}`, agentPlanSchema(maxSteps), input.projectPath);
+      const selectionStartedAt = Date.now();
+      this.#activity(input, requestId, { stage: "selecting", status: "running", message: "Модель выбирает направления поиска" });
+      let selectionResponse: Awaited<ReturnType<typeof requestContextSelection>>;
+      try {
+        selectionResponse = await requestContextSelection(provider, input.model, input.goal, preview.text ?? "", input.projectPath, signal);
+      } catch (error) {
+        if (signal.aborted) throw error;
+        this.#activity(input, requestId, { stage: "selecting", status: "running", message: "Модель повторно формирует выбор источников" });
+        selectionResponse = await requestContextSelection(
+          provider,
+          input.model,
+          `${input.goal}\n\nReturn a smaller valid source selection.`,
+          preview.text ?? "",
+          input.projectPath,
+          signal
+        );
+      }
+      const selection = normalizeContextSelection(selectionResponse.selection);
+      this.#activity(input, requestId, {
+        stage: "selecting",
+        status: "completed",
+        message: "Направления поиска выбраны",
+        sources: selection.projectRelativePaths.length + selection.artifactIds.length,
+        queries: selection.queries.length,
+        durationMs: Date.now() - selectionStartedAt
+      });
+      const pinnedArtifactIds = input.sessionId
+        ? (await readSession(input.projectPath, input.sessionId)).context?.map((reference) => reference.artifactId) ?? []
+        : [];
+      const researchStartedAt = Date.now();
+      this.#activity(input, requestId, { stage: "research", status: "running", message: "Читаю выбранные материалы" });
+      const researched = await this.context.research({
+        projectPath: input.projectPath,
+        query: input.goal,
+        queries: selection.queries,
+        projectRelativePaths: selection.projectRelativePaths,
+        artifactIds: [...new Set([...selection.artifactIds, ...pinnedArtifactIds])],
+        budgetTokens: contextBudgetTokens,
+        recipient: provider.recipient
+      });
+      researchSummary = {
+        sources: researched.sources,
+        tokenEstimate: researched.tokenEstimate,
+        truncated: researched.truncated
+      };
+      this.#activity(input, requestId, {
+        stage: "research",
+        status: "completed",
+        message: "Материалы прочитаны",
+        sources: researched.sources.length,
+        tokens: researched.tokenEstimate,
+        durationMs: Date.now() - researchStartedAt
+      });
+      const answerStartedAt = Date.now();
+      this.#activity(input, requestId, { stage: "answer", status: "running", message: "Модель формирует ответ" });
+      const reply = await requestAgentReply(
+        provider,
+        input.model,
+        input.goal,
+        researched.text ?? "No matching project material was found.",
+        input.projectPath,
+        {
+          signal,
+          onDelta: (delta) => this.emit("output.delta", {
+            requestId,
+            projectPath: input.projectPath,
+            sessionId: input.sessionId,
+            delta
+          } satisfies AgentOutputDelta)
+        }
+      );
+      responseText = reply.text;
+      this.#activity(input, requestId, {
+        stage: "answer",
+        status: "completed",
+        message: "Ответ сформирован",
+        tokens: reply.usage?.outputTokens,
+        durationMs: Date.now() - answerStartedAt
+      });
+      const planningStartedAt = Date.now();
+      this.#activity(input, requestId, { stage: "planning", status: "running", message: "Проверяю необходимые действия" });
+      let response;
+      try {
+        response = await requestAgentPlan(
+          provider,
+          input.model,
+          input.goal,
+          `${researched.text ?? "No matching project material was found."}\n\nOperations:\n${JSON.stringify(capabilities)}`,
+          agentPlanSchema(maxSteps),
+          input.projectPath,
+          signal
+        );
+      } catch (error) {
+        if (signal.aborted) throw error;
+        this.#activity(input, requestId, { stage: "planning", status: "running", message: "Модель исправляет структуру плана" });
+        response = await requestAgentPlan(
+          provider,
+          input.model,
+          `${input.goal}\n\nThe previous structured plan was incomplete. Return a smaller valid plan.`,
+          `${researched.text ?? "No matching project material was found."}\n\nOperations:\n${JSON.stringify(capabilities)}`,
+          agentPlanSchema(maxSteps),
+          input.projectPath,
+          signal
+        );
+      }
       const raw = response.plan;
       assertPlanCandidate(raw, maxSteps);
       const planned = raw as { goal: string; steps: AgentStep[] };
+      this.#activity(input, requestId, {
+        stage: "planning",
+        status: "completed",
+        message: planned.steps.length ? "План действий подготовлен" : "Изменения проекта не требуются",
+        steps: planned.steps.length,
+        durationMs: Date.now() - planningStartedAt
+      });
       candidate = { goal: planned.goal, steps: planned.steps, schemaVersion: "1", id: randomUUID(), createdAt: new Date().toISOString(), maxSteps, maxDurationSeconds };
       planningProviderId = provider.id;
       planningModel = response.model;
@@ -116,9 +299,44 @@ export class AgentOrchestrator {
     candidate.steps = candidate.steps.map((step) => this.#normalizeStep(step, input.projectPath));
     this.#validatePlan(candidate, maxSteps, input.projectPath);
     const now = new Date().toISOString();
-    const run: AgentRun = { id: randomUUID(), projectPath: input.projectPath, sessionId: input.sessionId, plan: candidate, providerId: planningProviderId, model: planningModel, status: "ready", stepJobs: {}, createdAt: now, updatedAt: now };
+    const run: AgentRun = {
+      id: randomUUID(),
+      projectPath: input.projectPath,
+      sessionId: input.sessionId,
+      plan: candidate,
+      providerId: planningProviderId,
+      model: planningModel,
+      response: responseText,
+      context: researchSummary,
+      activities: this.#activityTraces.get(requestId),
+      status: "ready",
+      stepJobs: {},
+      createdAt: now,
+      updatedAt: now
+    };
     await this.#persist(run);
-    if (input.sessionId) await appendSessionEvent(input.projectPath, input.sessionId, { type: "plan", data: { runId: run.id, plan: candidate, providerId: run.providerId, model: run.model } });
+    if (input.sessionId) {
+      if (run.activities?.length) {
+        await appendSessionEvent(input.projectPath, input.sessionId, {
+          type: "status",
+          data: { kind: "agent-activity", requestId, activities: run.activities }
+        });
+      }
+      if (responseText) {
+        await appendSessionEvent(input.projectPath, input.sessionId, {
+          type: "assistant-message",
+          data: {
+            content: responseText,
+            providerId: run.providerId,
+            model: run.model,
+            sources: run.context?.sources,
+            contextTokenEstimate: run.context?.tokenEstimate,
+            contextTruncated: run.context?.truncated
+          }
+        });
+      }
+      await appendSessionEvent(input.projectPath, input.sessionId, { type: "plan", data: { runId: run.id, plan: candidate, providerId: run.providerId, model: run.model } });
+    }
     return run;
   }
 
@@ -181,7 +399,16 @@ export class AgentOrchestrator {
   #normalizeStep(step: AgentStep, projectPath: string): AgentStep {
     const operation = this.registry.get(step.operationId, this.operations.projects.extensionVersions(projectPath)).definition;
     const dependsOn = [...new Set([...(step.dependsOn ?? []), ...(step.inputFromSteps ?? [])])];
-    return { ...step, dependsOn: dependsOn.length ? dependsOn : undefined, approvalRequired: ["network-egress", "external-side-effect", "privileged"].includes(operation.risk) };
+    const argumentsValue = { ...step.arguments };
+    if (step.operationId === "osnova.graph.link" && typeof argumentsValue.type === "string" && !argumentsValue.type.includes(".")) {
+      argumentsValue.type = `osnova.${argumentsValue.type.toLocaleLowerCase().replace(/[^a-z0-9_-]+/g, "-") || "related"}`;
+    }
+    return {
+      ...step,
+      arguments: argumentsValue,
+      dependsOn: dependsOn.length ? dependsOn : undefined,
+      approvalRequired: ["network-egress", "external-side-effect", "privileged"].includes(operation.risk)
+    };
   }
 
   #validatePlan(plan: AgentPlan, limit: number, projectPath: string): void {
@@ -227,6 +454,25 @@ export class AgentOrchestrator {
   }
 
   async #persist(run: AgentRun): Promise<void> { await writeJsonAtomic(path.join(this.dataRoot, "agent-runs", `${run.id}.json`), run); }
+
+  #activity(
+    input: CreatePlanInput,
+    requestId: string,
+    activity: Omit<AgentActivity, "requestId" | "projectPath" | "sessionId">
+  ): void {
+    const event = {
+      requestId,
+      projectPath: input.projectPath,
+      sessionId: input.sessionId,
+      ...activity
+    } satisfies AgentActivity;
+    const trace = this.#activityTraces.get(requestId) ?? [];
+    const existing = trace.findIndex((item) => item.stage === event.stage);
+    if (existing < 0) trace.push(event);
+    else trace[existing] = event;
+    this.#activityTraces.set(requestId, trace);
+    this.emit("activity", event);
+  }
 }
 
 function topologicalSteps(steps: AgentStep[]): AgentStep[] {
@@ -285,4 +531,26 @@ function agentPlanSchema(maxSteps: number): Record<string, unknown> {
 function assertPlanCandidate(value: unknown, maxSteps: number): asserts value is { goal: string; steps: AgentStep[] } {
   const validation = validateJsonSchema(agentPlanSchema(maxSteps), value);
   if (!validation.valid) throw new Error(`Model returned an invalid agent plan: ${validation.issues.join(" ")}`);
+}
+
+function normalizeContextSelection(value: unknown): { queries: string[]; projectRelativePaths: string[]; artifactIds: string[] } {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Model returned an invalid context selection.");
+  const record = value as Record<string, unknown>;
+  const stringList = (key: string, limit: number): string[] => {
+    const candidate = record[key];
+    if (!Array.isArray(candidate) || candidate.some((item) => typeof item !== "string")) {
+      throw new Error(`Model returned an invalid context selection field: ${key}.`);
+    }
+    return candidate.slice(0, limit) as string[];
+  };
+  return {
+    queries: stringList("queries", 6),
+    projectRelativePaths: stringList("projectRelativePaths", 12),
+    artifactIds: stringList("artifactIds", 8)
+  };
+}
+
+function numericField(value: Record<string, unknown> | undefined, key: string): number | undefined {
+  const candidate = value?.[key];
+  return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : undefined;
 }

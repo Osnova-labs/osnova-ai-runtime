@@ -13,6 +13,7 @@ import { RpcClient } from "./rpc-client.js";
 import { startRpcServer } from "./rpc-server.js";
 import { OsnovaRuntime } from "./runtime.js";
 import { ProjectIndexer } from "./context-broker.js";
+import { OpenAICompatibleProvider, requestAgentPlan, requestAgentReply } from "./model-provider.js";
 import { stageArtifacts } from "./operation-service.js";
 import { validateJsonSchema } from "./schema.js";
 import { createInvocationDirectories, removeInvocationDirectories } from "./runtime-supervisor.js";
@@ -74,6 +75,110 @@ test("portable context index keeps search available without node:sqlite", async 
     const matches = await indexer.search(item.projectPath, "architecture handbook");
     assert.equal(matches[0]?.title, "Portable");
   } finally { await rm(item.root, { recursive: true, force: true }); }
+});
+
+test("project context catalogs plain notes and resolves relevant content without artifact wrappers", async () => {
+  const item = await fixture();
+  try {
+    const note = await createNote(item.runtime.projects.get(item.projectPath), {
+      title: "Transformer architecture",
+      body: "Self-attention connects tokens through queries, keys and values."
+    });
+    const preview = await item.runtime.context.preview(item.projectPath);
+    assert.equal(preview.sources.some((source) => source.projectRelativePath === note.relativePath && source.kind === "note"), true);
+    const researched = await item.runtime.context.research({
+      projectPath: item.projectPath,
+      query: "How does self-attention work?",
+      projectRelativePaths: [note.relativePath],
+      budgetTokens: 500,
+      recipient: "local"
+    });
+    assert.match(researched.text ?? "", /queries, keys and values/);
+    assert.equal(researched.sources[0]?.projectRelativePath, note.relativePath);
+  } finally { await rm(item.root, { recursive: true, force: true }); }
+});
+
+test("OpenAI-compatible replies stream as plain text while plans remain bounded JSON", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { stream?: boolean };
+      if (request.stream) {
+        const encoder = new TextEncoder();
+        const chunks = [
+          `data: ${JSON.stringify({ model: "local-1", choices: [{ delta: { content: "При" } }] })}\r\n`,
+          `data: ${JSON.stringify({ model: "local-1", choices: [{ delta: { content: "вет" }, finish_reason: "stop" }] })}`
+        ];
+        return new Response(new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoder.encode(chunks[0].slice(0, 17)));
+            controller.enqueue(encoder.encode(chunks[0].slice(17) + chunks[1]));
+            controller.close();
+          }
+        }), { headers: { "content-type": "text/event-stream" } });
+      }
+      return new Response(JSON.stringify({
+        model: "local-1",
+        choices: [{ message: { content: "```json\n{\"goal\":\"read only\",\"steps\":[]}\n```" } }]
+      }), { headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    const provider = new OpenAICompatibleProvider("test.local", "http://127.0.0.1:1234/v1/", {
+      async set() {}, async get() { return undefined; }, async delete() {}
+    });
+    const deltas: string[] = [];
+    const reply = await requestAgentReply(provider, "local-1", "Поздоровайся", "", "/project", {
+      onDelta: (delta) => deltas.push(delta)
+    });
+    assert.equal(reply.text, "Привет");
+    assert.equal(deltas.join(""), "Привет");
+    const plan = await requestAgentPlan(provider, "local-1", "Только чтение", "", {
+      type: "object",
+      required: ["goal", "steps"],
+      properties: { goal: { type: "string" }, steps: { type: "array" } }
+    }, "/project");
+    assert.deepEqual(plan.plan, { goal: "read only", steps: [] });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("agent retries an incomplete source selection before reading project content", async () => {
+  const item = await fixture();
+  try {
+    let selectionCalls = 0;
+    item.runtime.agent.registerProvider({
+      id: "test.retry",
+      recipient: "local",
+      async complete(request) {
+        const properties = request.responseSchema?.properties as Record<string, unknown> | undefined;
+        if (properties?.queries) {
+          selectionCalls += 1;
+          return {
+            text: selectionCalls === 1
+              ? "{\"queries\":[\"transformer\""
+              : JSON.stringify({ queries: ["transformer"], projectRelativePaths: [], artifactIds: [] }),
+            model: request.model
+          };
+        }
+        if (!properties) {
+          request.onTextDelta?.("Recovered answer");
+          return { text: "Recovered answer", model: request.model };
+        }
+        return { text: JSON.stringify({ goal: "read", steps: [] }), model: request.model };
+      }
+    });
+    const run = await item.runtime.agent.plan({
+      projectPath: item.projectPath,
+      goal: "Read the project",
+      providerId: "test.retry",
+      model: "retry-1"
+    });
+    assert.equal(selectionCalls, 2);
+    assert.equal(run.response, "Recovered answer");
+    assert.equal(run.activities?.find((activity) => activity.stage === "selecting")?.status, "completed");
+  } finally {
+    await rm(item.root, { recursive: true, force: true });
+  }
 });
 
 test("operation schema validation resolves local refs and rejects unsafe patterns", () => {
@@ -327,7 +432,7 @@ test("unsigned extension requires developer mode and connects with scoped grants
         modelProviders: [{ id: "example.echo.model", title: "Echo model", runtimeId: "example.echo.runtime", recipient: "local", capabilities: ["chat", "structured-output"] }]
       }
     }, null, 2));
-    await writeFile(path.join(source, "server.js"), `const fs=require("node:fs");const path=require("node:path");const rl=require("node:readline").createInterface({input:process.stdin});rl.on("line",line=>{const q=JSON.parse(line);if(q.id===undefined)return;let result;if(q.method==="initialize")result={protocolVersion:"1"};else if(q.method==="shutdown")result={ok:true};else if(q.method==="health")result={status:"ready",pid:process.pid};else if(q.method==="context/resolve")result={level:q.params.level,text:"custom context:"+process.pid,sources:[{artifactId:q.params.artifactId}],sensitivity:"project",allowedRecipients:["local","cloud"],tokenEstimate:999,truncated:false,providerVersion:"example.echo.context/1"};else if(q.method==="models/complete")result={text:JSON.stringify({goal:"generated",steps:[]}),model:q.params.request.model};else if(q.method==="jobs/start"){fs.writeFileSync(path.join(q.params.paths.outbox,"report.md"),q.params.input.text);result={structured:{echoed:q.params.input.text,pid:process.pid},artifacts:[{type:"example.echo.report",payloads:[{path:"report.md",mediaType:"text/markdown"}],context:{mode:"custom",providerId:"example.echo.context"}}]};}else throw new Error("unknown");process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:q.id,result})+"\\n");});\n`);
+    await writeFile(path.join(source, "server.js"), `const fs=require("node:fs");const path=require("node:path");const rl=require("node:readline").createInterface({input:process.stdin});rl.on("line",line=>{const q=JSON.parse(line);if(q.id===undefined)return;let result;if(q.method==="initialize")result={protocolVersion:"1"};else if(q.method==="shutdown")result={ok:true};else if(q.method==="health")result={status:"ready",pid:process.pid};else if(q.method==="context/resolve")result={level:q.params.level,text:"custom context:"+process.pid,sources:[{artifactId:q.params.artifactId}],sensitivity:"project",allowedRecipients:["local","cloud"],tokenEstimate:999,truncated:false,providerVersion:"example.echo.context/1"};else if(q.method==="models/complete"){const properties=q.params.request.responseSchema?.properties;const text=!properties?"Generated answer":JSON.stringify(properties.queries?{queries:[],projectRelativePaths:[],artifactIds:[]}:{goal:"generated",steps:[]});result={text,model:q.params.request.model};}else if(q.method==="jobs/start"){fs.writeFileSync(path.join(q.params.paths.outbox,"report.md"),q.params.input.text);result={structured:{echoed:q.params.input.text,pid:process.pid},artifacts:[{type:"example.echo.report",payloads:[{path:"report.md",mediaType:"text/markdown"}],context:{mode:"custom",providerId:"example.echo.context"}}]};}else throw new Error("unknown");process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:q.id,result})+"\\n");});\n`);
     const packagePath = path.join(item.root, "echo.osnova-package.json");
     await packExtension(source, packagePath);
     const tamperedPath = path.join(item.root, "echo-tampered.osnova-package.json");
@@ -358,6 +463,7 @@ test("unsigned extension requires developer mode and connects with scoped grants
     assert.equal(customContext.tokenEstimate < 20, true);
     const generatedPlan = await item.runtime.agent.plan({ projectPath: item.projectPath, goal: "Local provider plan", providerId: "example.echo.model", model: "echo-1" });
     assert.equal(generatedPlan.plan.steps.length, 0);
+    assert.equal(generatedPlan.response, "Generated answer");
     const pipeline = await item.runtime.agent.plan({
       projectPath: item.projectPath, goal: "Chain tool artifacts",
       draft: { goal: "Chain tool artifacts", steps: [
@@ -445,8 +551,20 @@ test("cloud model context requires and records explicit recipient approval", asy
     let calls = 0;
     item.runtime.agent.registerProvider({
       id: "example.cloud", recipient: "cloud",
-      async complete(request) { calls += 1; return { text: JSON.stringify({ goal: "cloud", steps: [] }), model: request.model }; }
+      async complete(request) {
+        calls += 1;
+        const properties = request.responseSchema?.properties as Record<string, unknown> | undefined;
+        const text = !properties
+          ? "Cloud answer"
+          : JSON.stringify(properties.queries
+            ? { queries: [], projectRelativePaths: [], artifactIds: [] }
+            : { goal: "cloud", steps: [] });
+        if (!properties) request.onTextDelta?.(text);
+        return { text, model: request.model };
+      }
     });
+    const outputDeltas: string[] = [];
+    item.runtime.agent.on("output.delta", (event: { delta: string }) => outputDeltas.push(event.delta));
     const session = await createSession(item.runtime.projects.get(item.projectPath), { title: "Cloud planning" });
     await assert.rejects(() => item.runtime.agent.plan({ projectPath: item.projectPath, sessionId: session.id, goal: "Plan", providerId: "example.cloud", model: "cloud-1" }), /explicit data-recipient approval/);
     assert.equal(calls, 0);
@@ -454,11 +572,20 @@ test("cloud model context requires and records explicit recipient approval", asy
       projectPath: item.projectPath, sessionId: session.id, goal: "Plan", providerId: "example.cloud", model: "cloud-1",
       recipientApproval: { recipient: "cloud", approved: true, decidedAt: new Date().toISOString() }
     });
-    assert.equal(calls, 1);
+    assert.equal(calls, 3);
     assert.equal(cloudRun.providerId, "example.cloud");
     assert.equal(cloudRun.model, "cloud-1");
+    assert.equal(outputDeltas.join(""), "Cloud answer");
+    assert.deepEqual(cloudRun.activities?.map((activity) => [activity.stage, activity.status]), [
+      ["catalog", "completed"],
+      ["selecting", "completed"],
+      ["research", "completed"],
+      ["answer", "completed"],
+      ["planning", "completed"]
+    ]);
+    assert.equal(cloudRun.activities?.every((activity) => typeof activity.durationMs === "number"), true);
     const events = await (await import("@osnova/project")).readSessionEvents(item.projectPath, session.id);
-    assert.deepEqual(events.map((event) => event.type), ["approval", "plan"]);
+    assert.deepEqual(events.map((event) => event.type), ["approval", "status", "assistant-message", "plan"]);
     const sensitiveNote = await createNote(item.runtime.projects.get(item.projectPath), { title: "Local only", body: "Sensitive" });
     await registerExistingArtifact(item.runtime.projects.get(item.projectPath), {
       type: "example.sensitive", projectRelativePath: sensitiveNote.relativePath,
@@ -468,7 +595,7 @@ test("cloud model context requires and records explicit recipient approval", asy
       projectPath: item.projectPath, sessionId: session.id, goal: "Do not send", providerId: "example.cloud", model: "cloud-1",
       recipientApproval: { recipient: "cloud", approved: true, decidedAt: new Date().toISOString() }
     }), /Compact context cannot be sent to cloud/);
-    assert.equal(calls, 1);
+    assert.equal(calls, 3);
   } finally { await rm(item.root, { recursive: true, force: true }); }
 });
 
@@ -544,8 +671,13 @@ test("local RPC rejects a wrong token and executes an agent draft", async (conte
     const bad = new RpcClient(server.address, "wrong");
     await assert.rejects(() => bad.request("runtime.status"), /Unauthorized/);
     bad.close();
-    const session = await createSession(item.runtime.projects.get(item.projectPath), { title: "Agent" });
     const client = new RpcClient(server.address, server.token);
+    await rm(path.join(item.projectPath, "sessions"), { recursive: true, force: true });
+    const session = await client.request<{ id: string }>("session.create", {
+      projectPath: item.projectPath,
+      title: "Разобрать архитектуру трансформера"
+    });
+    assert.match(session.id, /^session-[a-f0-9-]{36}$/);
     const notifications: string[] = [];
     client.on("job.changed", () => notifications.push("job.changed"));
     client.on("artifact.published", () => notifications.push("artifact.published"));

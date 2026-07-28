@@ -1,12 +1,15 @@
 import { EventEmitter } from "node:events";
 import net from "node:net";
 import type { ArtifactDescriptor, JobDescriptor, RuntimeState } from "@osnova/types";
+import type { AgentActivity, AgentOutputDelta } from "./agent-orchestrator.js";
 
 export interface RuntimeNotificationMap {
   "job.changed": JobDescriptor;
   "approval.required": JobDescriptor;
   "runtime.changed": RuntimeState;
   "artifact.published": { projectPath: string; artifacts: ArtifactDescriptor[] };
+  "agent.activity": AgentActivity;
+  "agent.output.delta": AgentOutputDelta;
 }
 
 export type RuntimeNotification = {

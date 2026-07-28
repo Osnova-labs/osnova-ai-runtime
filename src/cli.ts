@@ -100,7 +100,7 @@ async function main(): Promise<void> {
 
 async function serve(runtime: OsnovaRuntime): Promise<void> {
   const handle = await startRpcServer(runtime);
-  print({ address: handle.address, token: handle.token, protocol: "osnova-rpc/1", pid: process.pid });
+  process.stdout.write(`${JSON.stringify({ address: handle.address, token: handle.token, protocol: "osnova-rpc/1", pid: process.pid })}\n`);
   const close = async () => { await handle.close(); await runtime.shutdown(); process.exit(0); };
   process.once("SIGINT", () => void close());
   process.once("SIGTERM", () => void close());

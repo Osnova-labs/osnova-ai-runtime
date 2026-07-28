@@ -1,6 +1,6 @@
 import { mkdir, open, readFile, rm } from "node:fs/promises";
 import path from "node:path";
-import { listArtifacts, listNotes, readArtifact, readNote } from "@osnova/project";
+import { listArtifacts, listAssets, listNotes, readArtifact, readNote } from "@osnova/project";
 import type { ApprovalDecision, ArtifactDescriptor, ContextEnvelope, ContextLevel } from "@osnova/types";
 import { writeJsonAtomic } from "./atomic.js";
 import { resolveSafeExistingFile } from "./atomic.js";
@@ -9,6 +9,17 @@ export interface ContextRequest {
   projectPath: string;
   artifactIds?: string[];
   level: ContextLevel;
+  budgetTokens: number;
+  recipient: "local" | "cloud";
+  approval?: ApprovalDecision;
+}
+
+export interface ContextResearchRequest {
+  projectPath: string;
+  query: string;
+  queries?: string[];
+  projectRelativePaths?: string[];
+  artifactIds?: string[];
   budgetTokens: number;
   recipient: "local" | "cloud";
   approval?: ApprovalDecision;
@@ -24,20 +35,190 @@ export class ContextBroker {
   register(providerId: string, provider: CustomContextProvider): void { this.#providers.set(providerId, provider); }
 
   async preview(projectPath: string, budgetTokens = 1_000): Promise<ContextEnvelope> {
-    const [artifacts, notes] = await Promise.all([listArtifacts(projectPath), listNotes(projectPath)]);
+    const [artifacts, notes, allAssets] = await Promise.all([listArtifacts(projectPath), listNotes(projectPath), listAssets(projectPath)]);
+    const assets = allAssets.filter((asset) => isContextAsset(asset.relativePath));
     const sensitive = artifacts.some((artifact) => artifact.metadata?.sensitivity === "sensitive");
-    const visibleArtifacts = artifacts.slice(0, 30);
+    const materialPaths = new Set([...notes.map((note) => note.relativePath), ...assets.map((asset) => asset.relativePath)]);
+    const visibleArtifacts = artifacts
+      .filter((artifact) => !artifact.payloads.length || artifact.payloads.some((payload) => !materialPaths.has(payload.path)))
+      .slice(0, 30);
+    const visibleNotes = notes.slice(0, 60);
+    const visibleAssets = assets.slice(0, 40);
     const lines = [
-      `Project context catalog: ${notes.length} notes, ${artifacts.length} registered artifacts.`,
-      ...notes.slice(0, 30).map((note) => `- note: ${note.title} (${note.relativePath})`),
+      `Project context catalog: ${notes.length} notes, ${assets.length} files, ${artifacts.length} registered artifacts.`,
+      ...visibleNotes.map((note) => `- note: ${note.title} (${note.relativePath})`),
+      ...visibleAssets.map((asset) => `- file: ${asset.name} (${asset.relativePath}, ${asset.mediaType ?? "unknown"})`),
       ...visibleArtifacts.map((artifact) => `- ${artifact.type}: ${artifact.title ?? artifact.id} [${artifact.id}]`)
     ];
     const text = lines.join("\n");
-    return envelope(
+    const catalog = envelope(
       "compact", truncate(text, Math.max(0, budgetTokens)),
-      visibleArtifacts.map((artifact) => ({ artifactId: artifact.id, providerId: "host.catalog" })),
+      [
+        ...visibleNotes.map((note) => ({
+          projectRelativePath: note.relativePath,
+          title: note.title,
+          kind: "note" as const,
+          providerId: "host.note-catalog"
+        })),
+        ...visibleAssets.map((asset) => ({
+          projectRelativePath: asset.relativePath,
+          title: asset.name,
+          kind: "asset" as const,
+          providerId: "host.asset-catalog"
+        })),
+        ...visibleArtifacts.map((artifact) => ({
+          artifactId: artifact.id,
+          title: artifact.title ?? artifact.id,
+          kind: "artifact" as const,
+          providerId: "host.catalog"
+        }))
+      ],
       sensitive ? "sensitive" : "project", sensitive ? ["local"] : ["local", "cloud"], "host.catalog/1"
     );
+    return {
+      ...catalog,
+      structured: {
+        availableSourceCount: notes.length + assets.length + artifacts.length,
+        catalogedSourceCount: catalog.sources.length,
+        notes: notes.length,
+        assets: assets.length,
+        artifacts: artifacts.length
+      }
+    };
+  }
+
+  async research(request: ContextResearchRequest): Promise<ContextEnvelope> {
+    const [artifacts, notes, allAssets] = await Promise.all([
+      listArtifacts(request.projectPath),
+      listNotes(request.projectPath),
+      listAssets(request.projectPath)
+    ]);
+    const assets = allAssets.filter((asset) => isContextAsset(asset.relativePath));
+    const artifactsById = new Map(artifacts.map((artifact) => [artifact.id, artifact]));
+    const notesByPath = new Map(notes.map((note) => [note.relativePath, note]));
+    const assetsByPath = new Map(assets.map((asset) => [asset.relativePath, asset]));
+    const policyByPath = new Map<string, ArtifactDescriptor>();
+    for (const artifact of artifacts) {
+      for (const payload of artifact.payloads) {
+        const current = policyByPath.get(payload.path);
+        if (!current || contextRestriction(artifact) > contextRestriction(current)) policyByPath.set(payload.path, artifact);
+      }
+    }
+
+    const requestedPaths = new Set(
+      (request.projectRelativePaths ?? []).filter((relativePath) => notesByPath.has(relativePath))
+    );
+    const queryTerms = tokenize([request.query, ...(request.queries ?? [])].join(" "));
+    const candidates = await Promise.all(notes.map(async (note) => {
+      const document = await readNote(request.projectPath, note.relativePath);
+      const policy = policyByPath.get(note.relativePath);
+      const mode = policy?.context?.mode ?? "automatic";
+      const searchableBody = mode === "none" || mode === "custom" ? "" : document.body;
+      const score = requestedPaths.has(note.relativePath)
+        ? 10_000
+        : scoreDocument(`${note.title}\n${note.relativePath}`, searchableBody, queryTerms);
+      return { note, document, policy, mode, score };
+    }));
+    const rankedNotes = candidates
+      .filter((candidate) => candidate.score > 0 && candidate.mode !== "none" && candidate.mode !== "custom")
+      .sort((left, right) => right.score - left.score || (right.note.updatedAt ?? "").localeCompare(left.note.updatedAt ?? ""))
+      .slice(0, 12);
+    const requestedAssetPaths = (request.projectRelativePaths ?? []).filter((relativePath) => assetsByPath.has(relativePath));
+
+    let remaining = Math.max(0, request.budgetTokens);
+    const parts: string[] = [];
+    const sources: ContextEnvelope["sources"] = [];
+    let truncated = false;
+    let sensitivity: ContextEnvelope["sensitivity"] = "project";
+    let recipients: ContextEnvelope["allowedRecipients"] = ["local", "cloud"];
+
+    for (const candidate of rankedNotes) {
+      if (remaining <= 0) { truncated = true; break; }
+      const policy = candidate.policy;
+      const noteSensitivity = policy?.metadata?.sensitivity === "sensitive" ? "sensitive" : "project";
+      const noteRecipients: ContextEnvelope["allowedRecipients"] = noteSensitivity === "sensitive" ? ["local"] : ["local", "cloud"];
+      if (!noteRecipients.includes(request.recipient)) {
+        throw new Error(`Material ${candidate.note.relativePath} cannot be sent to ${request.recipient}.`);
+      }
+      const declarative = candidate.mode === "declarative"
+        ? JSON.stringify(policy?.metadata ?? {}, null, 2)
+        : candidate.document.body;
+      const limited = truncate(`Source: ${candidate.note.title} (${candidate.note.relativePath})\n${declarative}`, remaining);
+      parts.push(limited.text);
+      sources.push({
+        projectRelativePath: candidate.note.relativePath,
+        title: candidate.note.title,
+        kind: "note",
+        providerId: candidate.mode === "declarative" ? "host.declarative" : "host.automatic"
+      });
+      remaining -= estimateTokens(limited.text);
+      truncated ||= limited.truncated;
+      if (noteSensitivity === "sensitive") sensitivity = "sensitive";
+      recipients = recipients.filter((recipient) => noteRecipients.includes(recipient));
+    }
+
+    for (const relativePath of requestedAssetPaths.slice(0, 8)) {
+      if (remaining <= 0) { truncated = true; break; }
+      const asset = assetsByPath.get(relativePath);
+      if (!asset) continue;
+      const policy = policyByPath.get(relativePath);
+      const mode = policy?.context?.mode ?? "automatic";
+      if (mode === "none" || mode === "custom") continue;
+      const assetSensitivity = policy?.metadata?.sensitivity === "sensitive" ? "sensitive" : "project";
+      const assetRecipients: ContextEnvelope["allowedRecipients"] = assetSensitivity === "sensitive" ? ["local"] : ["local", "cloud"];
+      if (!assetRecipients.includes(request.recipient)) throw new Error(`Material ${relativePath} cannot be sent to ${request.recipient}.`);
+      const header = `Source: ${asset.name} (${relativePath}, ${asset.mediaType ?? "unknown"}, ${asset.size} bytes)`;
+      const body = mode === "declarative"
+        ? JSON.stringify(policy?.metadata ?? {}, null, 2)
+        : isTextAsset(asset.mediaType, relativePath)
+          ? await readTextPrefix(await resolveSafeExistingFile(request.projectPath, relativePath, "Context asset"), remaining * 4 + 1)
+          : "Binary content is not exposed by the standard context provider.";
+      const limited = truncate(`${header}\n${body}`, remaining);
+      parts.push(limited.text);
+      sources.push({
+        projectRelativePath: relativePath,
+        title: asset.name,
+        kind: "asset",
+        providerId: mode === "declarative" ? "host.declarative" : "host.automatic"
+      });
+      remaining -= estimateTokens(limited.text);
+      truncated ||= limited.truncated;
+      if (assetSensitivity === "sensitive") sensitivity = "sensitive";
+      recipients = recipients.filter((recipient) => assetRecipients.includes(recipient));
+    }
+
+    for (const artifactId of request.artifactIds ?? []) {
+      if (remaining <= 0) { truncated = true; break; }
+      const artifact = artifactsById.get(artifactId);
+      if (!artifact) continue;
+      const resolved = await this.#resolveArtifact(
+        request.projectPath,
+        artifact,
+        "expanded",
+        remaining,
+        request.recipient,
+        request.approval
+      );
+      if (resolved.text) parts.push(resolved.text);
+      sources.push(...resolved.sources);
+      remaining -= resolved.tokenEstimate;
+      truncated ||= resolved.truncated;
+      if (resolved.sensitivity === "sensitive") sensitivity = "sensitive";
+      recipients = recipients.filter((recipient) => resolved.allowedRecipients.includes(recipient));
+    }
+
+    const text = parts.join("\n\n");
+    return {
+      level: "expanded",
+      text,
+      sources,
+      sensitivity,
+      allowedRecipients: recipients,
+      tokenEstimate: estimateTokens(text),
+      truncated,
+      freshness: new Date().toISOString(),
+      providerVersion: "host.research/1"
+    };
   }
 
   async resolve(request: ContextRequest): Promise<ContextEnvelope> {
@@ -218,7 +399,41 @@ function truncate(text: string, tokens: number): { text: string; truncated: bool
 }
 
 function estimateTokens(text: string): number { return Math.ceil(text.length / 4); }
+function tokenize(text: string): string[] {
+  return [...new Set(
+    text
+      .toLocaleLowerCase()
+      .match(/[\p{L}\p{N}_-]{3,}/gu)
+      ?.filter((term) => !CONTEXT_STOP_WORDS.has(term)) ?? []
+  )].slice(0, 32);
+}
+
+function scoreDocument(header: string, body: string, terms: string[]): number {
+  if (!terms.length) return 0;
+  const normalizedHeader = header.toLocaleLowerCase();
+  const normalizedBody = body.toLocaleLowerCase();
+  return terms.reduce((score, term) => {
+    if (normalizedHeader.includes(term)) return score + 12;
+    if (normalizedBody.includes(term)) return score + 3;
+    return score;
+  }, 0);
+}
+
+const CONTEXT_STOP_WORDS = new Set([
+  "the", "and", "for", "with", "что", "как", "это", "для", "или", "при", "про", "надо",
+  "нужно", "можно", "хочу", "помоги", "расскажи", "сделай", "проект", "проекте"
+]);
+
 function isTextMedia(mediaType: string): boolean { return mediaType.startsWith("text/") || ["application/json", "application/ld+json", "application/xml"].includes(mediaType); }
+function isTextAsset(mediaType: string | undefined, relativePath: string): boolean {
+  if (mediaType && isTextMedia(mediaType)) return true;
+  return /\.(?:c|cc|cpp|css|csv|go|h|hpp|html|ini|java|js|jsx|kt|log|mjs|py|rb|rs|sh|sql|svg|toml|ts|tsx|xml|ya?ml)$/i.test(relativePath);
+}
+function isContextAsset(relativePath: string): boolean {
+  const segments = relativePath.toLocaleLowerCase().split("/");
+  if (segments.some((segment) => ["__pycache__", "node_modules", "dist", "build", "coverage", ".venv"].includes(segment))) return false;
+  return !/\.(?:class|o|obj|pyc|pyo)$/i.test(relativePath);
+}
 function readField(value: Record<string, unknown>, field: string): unknown {
   let cursor: unknown = value;
   for (const part of field.split(".")) {
